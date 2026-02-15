@@ -2,7 +2,7 @@ use rand::seq::SliceRandom;
 use rand::thread_rng;
 use rand_distr::{Distribution, Normal};
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::rc::Rc;
@@ -536,6 +536,66 @@ fn forward(
     linear(&x, &model.lm_head)
 }
 
+fn train_network(
+    docs: &[String],
+    uchars: &[char],
+    bos_token_id: usize,
+    model: &Model,
+    params: &[ValueRef],
+    adam: &mut Adam,
+) {
+    let char_to_token_id: HashMap<char, usize> =
+        uchars.iter().enumerate().map(|(i, ch)| (*ch, i)).collect();
+
+    let num_steps = adam.options.num_steps;
+    for step in 0..num_steps {
+        let doc = &docs[step % docs.len()];
+
+        let mut tokens = Vec::with_capacity(doc.chars().count() + 2);
+        tokens.push(bos_token_id);
+        for ch in doc.chars() {
+            if let Some(token_id) = char_to_token_id.get(&ch) {
+                tokens.push(*token_id);
+            }
+        }
+        tokens.push(bos_token_id);
+
+        let n = model.arch.block_size.min(tokens.len().saturating_sub(1));
+
+        let mut keys = vec![Vec::<Vec<ValueRef>>::new(); model.arch.n_layer];
+        let mut values = vec![Vec::<Vec<ValueRef>>::new(); model.arch.n_layer];
+        let mut losses = Vec::with_capacity(n);
+
+        for pos_id in 0..n {
+            let token_id = tokens[pos_id];
+            let target_id = tokens[pos_id + 1];
+
+            let logits = forward(token_id, pos_id, model, &mut keys, &mut values);
+            let probs = softmax(&logits);
+            let neg_one = (-1.0_f64).scalar();
+            let log_prob = Value::log(&probs[target_id]);
+            let loss_t = Value::mul(&neg_one, &log_prob);
+            losses.push(loss_t);
+        }
+
+        let total_loss = losses
+            .iter()
+            .fold(0.0.scalar(), |acc, loss_t| Value::add(&acc, loss_t));
+        let inv_n = (1.0 / n as f64).scalar();
+        let loss = Value::mul(&inv_n, &total_loss);
+
+        Value::backward(&loss);
+        adam.step(params);
+
+        println!(
+            "step {:4} / {:4} | loss {:.4}",
+            step + 1,
+            num_steps,
+            loss.borrow().data
+        );
+    }
+}
+
 fn get_input_dataset() -> Result<Vec<String>, Box<dyn std::error::Error>> {
     const INPUT_FILE: &str = "input.txt";
     const NAMES_URL: &str =
@@ -584,10 +644,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let model = Model::new(arch, vocab_size)?;
     let params = model.params();
-    let _adam = Adam::new(params.len(), AdamOption::default());
+    let mut adam = Adam::new(params.len(), AdamOption::default());
 
     println!("num docs: {}", docs.len());
     println!("vocab size: {}", vocab_size);
     println!("num params: {}", params.len());
+
+    train_network(&docs, &uchars, bos, &model, &params, &mut adam);
     Ok(())
 }
