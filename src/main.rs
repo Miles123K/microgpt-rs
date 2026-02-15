@@ -1,4 +1,6 @@
 use rand::seq::SliceRandom;
+use rand::thread_rng;
+use rand_distr::{Distribution, Normal};
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fs;
@@ -143,6 +145,140 @@ impl Value {
 
             for (child, local_grad) in children.into_iter().zip(local_grads.into_iter()) {
                 child.borrow_mut().grad += local_grad * node_grad;
+            }
+        }
+    }
+}
+
+pub type Matrix = Vec<Vec<ValueRef>>;
+
+#[derive(Debug, Clone, Copy)]
+pub struct Architecture {
+    /// Embedding width (hidden size) for each token position.
+    pub n_embd: usize,
+    /// Number of attention heads per transformer layer.
+    pub n_head: usize,
+    /// Number of stacked transformer layers.
+    pub n_layer: usize,
+    /// Maximum sequence length the model attends over.
+    pub block_size: usize,
+}
+
+impl Architecture {
+    /// Width of a single attention head (`n_embd / n_head`).
+    pub fn head_dim(self) -> usize {
+        self.n_embd / self.n_head
+    }
+}
+
+/// Learnable parameters for one transformer block.
+#[derive(Debug)]
+pub struct TransformerLayer {
+    /// Query projection weights for self-attention.
+    pub attn_wq: Matrix,
+    /// Key projection weights for self-attention.
+    pub attn_wk: Matrix,
+    /// Value projection weights for self-attention.
+    pub attn_wv: Matrix,
+    /// Output projection weights after attention heads are combined.
+    pub attn_wo: Matrix,
+    /// First feed-forward projection (expands width to `4 * n_embd`).
+    pub mlp_fc1: Matrix,
+    /// Second feed-forward projection (projects back to `n_embd`).
+    pub mlp_fc2: Matrix,
+}
+
+/// Full GPT-style model parameter container.
+#[derive(Debug)]
+pub struct Model {
+    pub arch: Architecture,
+    pub vocab_size: usize,
+    /// Token embedding table (token id -> embedding vector).
+    pub wte: Matrix,
+    /// Positional embedding table (position index -> embedding vector).
+    pub wpe: Matrix,
+    /// Final projection to vocabulary logits.
+    pub lm_head: Matrix,
+    /// Stack of transformer layers.
+    pub layers: Vec<TransformerLayer>,
+}
+
+impl Model {
+    pub fn new(arch: Architecture, vocab_size: usize) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_std(arch, vocab_size, 0.08)
+    }
+
+    pub fn new_with_std(
+        arch: Architecture,
+        vocab_size: usize,
+        std: f64,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut rng = thread_rng();
+        let normal = Normal::new(0.0, std)?;
+
+        let wte = Self::random_matrix(vocab_size, arch.n_embd, &normal, &mut rng);
+        let wpe = Self::random_matrix(arch.block_size, arch.n_embd, &normal, &mut rng);
+        let lm_head = Self::random_matrix(vocab_size, arch.n_embd, &normal, &mut rng);
+
+        let mut layers = Vec::with_capacity(arch.n_layer);
+        for _ in 0..arch.n_layer {
+            layers.push(TransformerLayer {
+                attn_wq: Self::random_matrix(arch.n_embd, arch.n_embd, &normal, &mut rng),
+                attn_wk: Self::random_matrix(arch.n_embd, arch.n_embd, &normal, &mut rng),
+                attn_wv: Self::random_matrix(arch.n_embd, arch.n_embd, &normal, &mut rng),
+                attn_wo: Self::random_matrix(arch.n_embd, arch.n_embd, &normal, &mut rng),
+                mlp_fc1: Self::random_matrix(4 * arch.n_embd, arch.n_embd, &normal, &mut rng),
+                mlp_fc2: Self::random_matrix(arch.n_embd, 4 * arch.n_embd, &normal, &mut rng),
+            });
+        }
+
+        Ok(Self {
+            arch,
+            vocab_size,
+            wte,
+            wpe,
+            lm_head,
+            layers,
+        })
+    }
+
+    fn random_matrix<R: rand::Rng + ?Sized>(
+        nout: usize,
+        nin: usize,
+        normal: &Normal<f64>,
+        rng: &mut R,
+    ) -> Matrix {
+        (0..nout)
+            .map(|_| {
+                (0..nin)
+                    .map(|_| Value::new(normal.sample(rng)))
+                    .collect::<Vec<ValueRef>>()
+            })
+            .collect()
+    }
+
+    pub fn params(&self) -> Vec<ValueRef> {
+        let mut params = Vec::new();
+        Self::flatten_matrix(&self.wte, &mut params);
+        Self::flatten_matrix(&self.wpe, &mut params);
+        Self::flatten_matrix(&self.lm_head, &mut params);
+
+        for layer in &self.layers {
+            Self::flatten_matrix(&layer.attn_wq, &mut params);
+            Self::flatten_matrix(&layer.attn_wk, &mut params);
+            Self::flatten_matrix(&layer.attn_wv, &mut params);
+            Self::flatten_matrix(&layer.attn_wo, &mut params);
+            Self::flatten_matrix(&layer.mlp_fc1, &mut params);
+            Self::flatten_matrix(&layer.mlp_fc2, &mut params);
+        }
+
+        params
+    }
+
+    fn flatten_matrix(matrix: &Matrix, out: &mut Vec<ValueRef>) {
+        for row in matrix {
+            for param in row {
+                out.push(Rc::clone(param));
             }
         }
     }
