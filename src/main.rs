@@ -2,9 +2,12 @@ use rand::distributions::WeightedIndex;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use rand_distr::{Distribution, Normal};
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::Path;
 use std::rc::Rc;
 
@@ -152,8 +155,44 @@ impl Value {
 }
 
 pub type Matrix = Vec<Vec<ValueRef>>;
+type NumericMatrix = Vec<Vec<f64>>;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TransformerLayerCheckpoint {
+    pub attn_wq: NumericMatrix,
+    pub attn_wk: NumericMatrix,
+    pub attn_wv: NumericMatrix,
+    pub attn_wo: NumericMatrix,
+    pub mlp_fc1: NumericMatrix,
+    pub mlp_fc2: NumericMatrix,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ModelCheckpoint {
+    pub arch: Architecture,
+    pub vocab_size: usize,
+    pub wte: NumericMatrix,
+    pub wpe: NumericMatrix,
+    pub lm_head: NumericMatrix,
+    pub layers: Vec<TransformerLayerCheckpoint>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AdamCheckpoint {
+    pub options: AdamOption,
+    pub step_count: usize,
+    pub first_moment_buffer: Vec<f64>,
+    pub second_moment_buffer: Vec<f64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Checkpoint {
+    pub format_version: u32,
+    pub model: ModelCheckpoint,
+    pub adam: AdamCheckpoint,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Architecture {
     /// Embedding width (hidden size) for each token position.
     pub n_embd: usize,
@@ -205,7 +244,7 @@ pub struct Model {
 }
 
 /// Hyperparameters for Adam optimizer.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct AdamOption {
     pub learning_rate: f64,
     pub beta1: f64,
@@ -285,6 +324,24 @@ impl Adam {
         }
 
         self.step_count += 1;
+    }
+
+    pub fn to_checkpoint(&self) -> AdamCheckpoint {
+        AdamCheckpoint {
+            options: self.options,
+            step_count: self.step_count,
+            first_moment_buffer: self.first_moment_buffer.clone(),
+            second_moment_buffer: self.second_moment_buffer.clone(),
+        }
+    }
+
+    pub fn from_checkpoint(checkpoint: AdamCheckpoint) -> Self {
+        Self {
+            options: checkpoint.options,
+            step_count: checkpoint.step_count,
+            first_moment_buffer: checkpoint.first_moment_buffer,
+            second_moment_buffer: checkpoint.second_moment_buffer,
+        }
     }
 }
 
@@ -366,6 +423,106 @@ impl Model {
                 out.push(Rc::clone(param));
             }
         }
+    }
+
+    pub fn to_checkpoint(&self) -> ModelCheckpoint {
+        ModelCheckpoint {
+            arch: self.arch,
+            vocab_size: self.vocab_size,
+            wte: Self::matrix_to_numeric(&self.wte),
+            wpe: Self::matrix_to_numeric(&self.wpe),
+            lm_head: Self::matrix_to_numeric(&self.lm_head),
+            layers: self
+                .layers
+                .iter()
+                .map(|layer| TransformerLayerCheckpoint {
+                    attn_wq: Self::matrix_to_numeric(&layer.attn_wq),
+                    attn_wk: Self::matrix_to_numeric(&layer.attn_wk),
+                    attn_wv: Self::matrix_to_numeric(&layer.attn_wv),
+                    attn_wo: Self::matrix_to_numeric(&layer.attn_wo),
+                    mlp_fc1: Self::matrix_to_numeric(&layer.mlp_fc1),
+                    mlp_fc2: Self::matrix_to_numeric(&layer.mlp_fc2),
+                })
+                .collect(),
+        }
+    }
+
+    pub fn from_checkpoint(checkpoint: ModelCheckpoint) -> Self {
+        Self {
+            arch: checkpoint.arch,
+            vocab_size: checkpoint.vocab_size,
+            wte: Self::matrix_from_numeric(checkpoint.wte),
+            wpe: Self::matrix_from_numeric(checkpoint.wpe),
+            lm_head: Self::matrix_from_numeric(checkpoint.lm_head),
+            layers: checkpoint
+                .layers
+                .into_iter()
+                .map(|layer| TransformerLayer {
+                    attn_wq: Self::matrix_from_numeric(layer.attn_wq),
+                    attn_wk: Self::matrix_from_numeric(layer.attn_wk),
+                    attn_wv: Self::matrix_from_numeric(layer.attn_wv),
+                    attn_wo: Self::matrix_from_numeric(layer.attn_wo),
+                    mlp_fc1: Self::matrix_from_numeric(layer.mlp_fc1),
+                    mlp_fc2: Self::matrix_from_numeric(layer.mlp_fc2),
+                })
+                .collect(),
+        }
+    }
+
+    fn matrix_to_numeric(matrix: &Matrix) -> NumericMatrix {
+        matrix
+            .iter()
+            .map(|row| row.iter().map(|v| v.borrow().data).collect())
+            .collect()
+    }
+
+    fn matrix_from_numeric(matrix: NumericMatrix) -> Matrix {
+        matrix
+            .into_iter()
+            .map(|row| row.into_iter().map(Value::new).collect())
+            .collect()
+    }
+}
+
+impl Checkpoint {
+    pub fn new(model: &Model, adam: &Adam) -> Self {
+        Self {
+            format_version: 1,
+            model: model.to_checkpoint(),
+            adam: adam.to_checkpoint(),
+        }
+    }
+
+    pub fn save_to_file(&self, file_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let bytes = bincode::serialize(self)?;
+        fs::write(file_path, bytes)?;
+        Ok(())
+    }
+
+    pub fn load_from_file(file_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let bytes = fs::read(file_path)?;
+        let checkpoint: Checkpoint = bincode::deserialize(&bytes)?;
+        Ok(checkpoint)
+    }
+
+    pub fn load_from_file_if_exists(
+        file_path: &str,
+    ) -> Result<Option<Self>, Box<dyn std::error::Error>> {
+        match fs::read(file_path) {
+            Ok(bytes) => {
+                let checkpoint: Checkpoint = bincode::deserialize(&bytes)?;
+                Ok(Some(checkpoint))
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    pub fn into_model_and_adam(self) -> (Model, Adam) {
+        (
+            Model::from_checkpoint(self.model),
+            Adam::from_checkpoint(self.adam),
+        )
     }
 }
 
@@ -675,27 +832,119 @@ fn get_unique_chars_tokenizer(docs: &[String]) -> Result<Vec<char>, Box<dyn std:
     Ok(uchars)
 }
 
+enum RunMode {
+    Train,
+    Inference,
+}
+
+struct CliOptions {
+    mode: RunMode,
+    location: String,
+}
+
+fn parse_cli_options() -> Result<CliOptions, Box<dyn std::error::Error>> {
+    let mut mode: Option<RunMode> = None;
+    let mut location: Option<String> = None;
+
+    for arg in env::args().skip(1) {
+        if arg == "--train" {
+            if mode.is_some() {
+                return Err("choose only one mode: --train or --inference".into());
+            }
+            mode = Some(RunMode::Train);
+            continue;
+        }
+
+        if arg == "--inference" {
+            if mode.is_some() {
+                return Err("choose only one mode: --train or --inference".into());
+            }
+            mode = Some(RunMode::Inference);
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--location=") {
+            if value.is_empty() {
+                return Err("--location must not be empty".into());
+            }
+            location = Some(value.to_string());
+            continue;
+        }
+
+        return Err(format!("unrecognized argument: {arg}").into());
+    }
+
+    let mode = mode.ok_or("mode required: use --train or --inference")?;
+    let location = location.ok_or("location required: --location=<path>")?;
+    Ok(CliOptions { mode, location })
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = parse_cli_options()?;
+
     let docs = get_input_dataset()?;
     let uchars = get_unique_chars_tokenizer(&docs)?;
     let bos = uchars.len();
     let vocab_size = bos + 1;
 
-    let arch = Architecture {
-        n_embd: 16,
-        n_head: 4,
-        n_layer: 1,
-        block_size: 16,
-    };
-    let model = Model::new(arch, vocab_size)?;
-    let params = model.params();
-    let mut adam = Adam::new(params.len(), AdamOption::default());
+    match cli.mode {
+        RunMode::Train => {
+            let (model, mut adam) =
+                if let Some(checkpoint) = Checkpoint::load_from_file_if_exists(&cli.location)? {
+                    if checkpoint.model.vocab_size != vocab_size {
+                        return Err(format!(
+                        "checkpoint vocab_size ({}) does not match current dataset vocab_size ({})",
+                        checkpoint.model.vocab_size, vocab_size
+                    )
+                    .into());
+                    }
+                    checkpoint.into_model_and_adam()
+                } else {
+                    let arch = Architecture {
+                        n_embd: 16,
+                        n_head: 4,
+                        n_layer: 1,
+                        block_size: 16,
+                    };
+                    let model = Model::new(arch, vocab_size)?;
+                    let params = model.params();
+                    let adam = Adam::new(params.len(), AdamOption::default());
+                    (model, adam)
+                };
 
-    println!("num docs: {}", docs.len());
-    println!("vocab size: {}", vocab_size);
-    println!("num params: {}", params.len());
+            let params = model.params();
+            if params.len() != adam.first_moment_buffer.len()
+                || params.len() != adam.second_moment_buffer.len()
+            {
+                return Err(
+                    "checkpoint optimizer state size does not match model parameter count".into(),
+                );
+            }
 
-    train_network(&docs, &uchars, bos, &model, &params, &mut adam);
-    inference(&uchars, bos, &model, 0.5, 20);
+            println!("num docs: {}", docs.len());
+            println!("vocab size: {}", vocab_size);
+            println!("num params: {}", params.len());
+
+            train_network(&docs, &uchars, bos, &model, &params, &mut adam);
+            let checkpoint = Checkpoint::new(&model, &adam);
+            checkpoint.save_to_file(&cli.location)?;
+            println!("saved checkpoint to {}", cli.location);
+        }
+        RunMode::Inference => {
+            let checkpoint = Checkpoint::load_from_file_if_exists(&cli.location)?
+                .ok_or_else(|| format!("checkpoint not found at {}", cli.location))?;
+            if checkpoint.model.vocab_size != vocab_size {
+                return Err(format!(
+                    "checkpoint vocab_size ({}) does not match current dataset vocab_size ({})",
+                    checkpoint.model.vocab_size, vocab_size
+                )
+                .into());
+            }
+
+            let (model, _adam) = checkpoint.into_model_and_adam();
+            inference(&uchars, bos, &model, 0.5, 20);
+        }
+    }
+
     Ok(())
 }
