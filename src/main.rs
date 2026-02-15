@@ -203,6 +203,90 @@ pub struct Model {
     pub layers: Vec<TransformerLayer>,
 }
 
+/// Hyperparameters for Adam optimizer.
+#[derive(Debug, Clone, Copy)]
+pub struct AdamOption {
+    pub learning_rate: f64,
+    pub beta1: f64,
+    pub beta2: f64,
+    pub epsilon: f64,
+    pub num_steps: usize,
+}
+
+impl Default for AdamOption {
+    fn default() -> Self {
+        Self {
+            learning_rate: 0.01,
+            beta1: 0.85,
+            beta2: 0.99,
+            epsilon: 1e-8,
+            num_steps: 1000,
+        }
+    }
+}
+
+/// Adam optimizer state buffers aligned with a flattened parameter vector.
+#[derive(Debug)]
+pub struct Adam {
+    pub options: AdamOption,
+    pub step_count: usize,
+    pub first_moment_buffer: Vec<f64>,
+    pub second_moment_buffer: Vec<f64>,
+}
+
+impl Adam {
+    pub fn new(parameter_count: usize, options: AdamOption) -> Self {
+        Self {
+            options,
+            step_count: 0,
+            first_moment_buffer: vec![0.0; parameter_count],
+            second_moment_buffer: vec![0.0; parameter_count],
+        }
+    }
+
+    pub fn step(&mut self, params: &[ValueRef]) {
+        debug_assert_eq!(
+            params.len(),
+            self.first_moment_buffer.len(),
+            "params and first_moment_buffer length mismatch"
+        );
+        debug_assert_eq!(
+            params.len(),
+            self.second_moment_buffer.len(),
+            "params and second_moment_buffer length mismatch"
+        );
+
+        let current_step = self.step_count;
+        let t = (current_step + 1) as f64;
+
+        let lr_t = if self.options.num_steps == 0 {
+            self.options.learning_rate
+        } else {
+            let clamped_step = current_step.min(self.options.num_steps);
+            let decay = 1.0 - (clamped_step as f64 / self.options.num_steps as f64);
+            self.options.learning_rate * decay
+        };
+
+        for (index, param) in params.iter().enumerate() {
+            let grad = param.borrow().grad;
+
+            let m = &mut self.first_moment_buffer[index];
+            let v = &mut self.second_moment_buffer[index];
+            *m = self.options.beta1 * *m + (1.0 - self.options.beta1) * grad;
+            *v = self.options.beta2 * *v + (1.0 - self.options.beta2) * grad * grad;
+
+            let m_hat = *m / (1.0 - self.options.beta1.powf(t));
+            let v_hat = *v / (1.0 - self.options.beta2.powf(t));
+
+            let mut param_mut = param.borrow_mut();
+            param_mut.data -= lr_t * m_hat / (v_hat.sqrt() + self.options.epsilon);
+            param_mut.grad = 0.0;
+        }
+
+        self.step_count += 1;
+    }
+}
+
 impl Model {
     pub fn new(arch: Architecture, vocab_size: usize) -> Result<Self, Box<dyn std::error::Error>> {
         Self::new_with_std(arch, vocab_size, 0.08)
@@ -492,7 +576,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bos = uchars.len();
     let vocab_size = bos + 1;
 
+    let arch = Architecture {
+        n_embd: 16,
+        n_head: 4,
+        n_layer: 1,
+        block_size: 16,
+    };
+    let model = Model::new(arch, vocab_size)?;
+    let params = model.params();
+    let _adam = Adam::new(params.len(), AdamOption::default());
+
     println!("num docs: {}", docs.len());
     println!("vocab size: {}", vocab_size);
+    println!("num params: {}", params.len());
     Ok(())
 }
