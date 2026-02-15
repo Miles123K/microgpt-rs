@@ -1,3 +1,4 @@
+use rand::distributions::WeightedIndex;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use rand_distr::{Distribution, Normal};
@@ -596,6 +597,50 @@ fn train_network(
     }
 }
 
+fn inference(
+    uchars: &[char],
+    bos_token_id: usize,
+    model: &Model,
+    temperature: f64,
+    num_samples: usize,
+) {
+    debug_assert!(temperature > 0.0 && temperature <= 1.0);
+    let inv_temperature = 1.0 / temperature;
+
+    println!("\n--- inference (new, hallucinated names) ---");
+    let mut rng = thread_rng();
+
+    for sample_idx in 0..num_samples {
+        let mut keys = vec![Vec::<Vec<ValueRef>>::new(); model.arch.n_layer];
+        let mut values = vec![Vec::<Vec<ValueRef>>::new(); model.arch.n_layer];
+        let mut token_id = bos_token_id;
+        let mut sample = String::new();
+
+        for pos_id in 0..model.arch.block_size {
+            let logits = forward(token_id, pos_id, model, &mut keys, &mut values);
+            let scaled_logits: Vec<ValueRef> = logits
+                .iter()
+                .map(|logit| Value::mul(logit, &inv_temperature.scalar()))
+                .collect();
+            let probs = softmax(&scaled_logits);
+
+            let weights: Vec<f64> = probs.iter().map(|p| p.borrow().data).collect();
+            let distribution = match WeightedIndex::new(&weights) {
+                Ok(distribution) => distribution,
+                Err(_) => break,
+            };
+
+            token_id = distribution.sample(&mut rng);
+            if token_id == bos_token_id {
+                break;
+            }
+            sample.push(uchars[token_id]);
+        }
+
+        println!("sample {:2}: {}", sample_idx + 1, sample);
+    }
+}
+
 fn get_input_dataset() -> Result<Vec<String>, Box<dyn std::error::Error>> {
     const INPUT_FILE: &str = "input.txt";
     const NAMES_URL: &str =
@@ -651,5 +696,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("num params: {}", params.len());
 
     train_network(&docs, &uchars, bos, &model, &params, &mut adam);
+    inference(&uchars, bos, &model, 0.5, 20);
     Ok(())
 }
