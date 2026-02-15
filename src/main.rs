@@ -284,6 +284,174 @@ impl Model {
     }
 }
 
+trait ScalarValueExt {
+    fn scalar(self) -> ValueRef;
+}
+
+impl ScalarValueExt for f64 {
+    fn scalar(self) -> ValueRef {
+        Value::new(self)
+    }
+}
+
+trait ValueVecExt {
+    fn add_vec(&self, rhs: &[ValueRef]) -> Vec<ValueRef>;
+}
+
+impl ValueVecExt for [ValueRef] {
+    fn add_vec(&self, rhs: &[ValueRef]) -> Vec<ValueRef> {
+        debug_assert_eq!(self.len(), rhs.len(), "vector sizes must match");
+        self.iter()
+            .zip(rhs.iter())
+            .map(|(a, b)| Value::add(a, b))
+            .collect()
+    }
+}
+
+/// Applies a bias-free linear projection: `y = W x`.
+///
+/// `w` is row-major with shape `[nout][nin]`, and `x` has length `nin`.
+fn linear(x: &[ValueRef], w: &Matrix) -> Vec<ValueRef> {
+    w.iter()
+        .map(|row| {
+            debug_assert_eq!(row.len(), x.len(), "row width must match input width");
+            row.iter()
+                .zip(x.iter())
+                .fold(0.0.scalar(), |acc, (wi, xi)| {
+                    let prod = Value::mul(wi, xi);
+                    Value::add(&acc, &prod)
+                })
+        })
+        .collect()
+}
+
+/// Softmax over a vector of logits.
+fn softmax(logits: &[ValueRef]) -> Vec<ValueRef> {
+    let max_val = logits
+        .iter()
+        .map(|v| v.borrow().data)
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    let exps: Vec<ValueRef> = logits
+        .iter()
+        .map(|val| {
+            let shifted = Value::add(val, &(-max_val).scalar());
+            Value::exp(&shifted)
+        })
+        .collect();
+
+    let total = exps.iter().fold(0.0.scalar(), |acc, e| Value::add(&acc, e));
+    let inv_total = Value::powf(&total, -1.0);
+
+    exps.iter().map(|e| Value::mul(e, &inv_total)).collect()
+}
+
+/// RMSNorm without affine gain/bias.
+fn rmsnorm(x: &[ValueRef]) -> Vec<ValueRef> {
+    let sumsq = x.iter().fold(0.0.scalar(), |acc, xi| {
+        let sq = Value::mul(xi, xi);
+        Value::add(&acc, &sq)
+    });
+
+    let inv_len = 1.0 / (x.len() as f64);
+    let ms = Value::mul(&sumsq, &inv_len.scalar());
+    let ms_eps = Value::add(&ms, &1e-5_f64.scalar());
+    let scale = Value::powf(&ms_eps, -0.5);
+
+    x.iter().map(|xi| Value::mul(xi, &scale)).collect()
+}
+
+/// Stateless GPT forward step for one `(token_id, pos_id)`.
+///
+/// `keys` and `values` are KV caches, indexed as `[layer][time][n_embd]`.
+fn forward(
+    token_id: usize,
+    pos_id: usize,
+    model: &Model,
+    keys: &mut [Vec<Vec<ValueRef>>],
+    values: &mut [Vec<Vec<ValueRef>>],
+) -> Vec<ValueRef> {
+    debug_assert_eq!(
+        keys.len(),
+        model.arch.n_layer,
+        "keys cache must match layer count"
+    );
+    debug_assert_eq!(
+        values.len(),
+        model.arch.n_layer,
+        "values cache must match layer count"
+    );
+
+    let tok_emb = model.wte[token_id].clone();
+    let pos_emb = model.wpe[pos_id].clone();
+    let mut x = tok_emb.add_vec(&pos_emb);
+    x = rmsnorm(&x);
+
+    let head_dim = model.arch.head_dim();
+    let attn_scale = 1.0 / (head_dim as f64).sqrt();
+
+    for li in 0..model.arch.n_layer {
+        let layer = &model.layers[li];
+
+        let x_residual = x.clone();
+        x = rmsnorm(&x);
+
+        let q = linear(&x, &layer.attn_wq);
+        let k = linear(&x, &layer.attn_wk);
+        let v = linear(&x, &layer.attn_wv);
+        keys[li].push(k.clone());
+        values[li].push(v.clone());
+
+        let mut x_attn = Vec::with_capacity(model.arch.n_embd);
+        for h in 0..model.arch.n_head {
+            let hs = h * head_dim;
+            let he = hs + head_dim;
+            let q_h = &q[hs..he];
+
+            let attn_logits: Vec<ValueRef> = keys[li]
+                .iter()
+                .map(|k_t| {
+                    let k_h = &k_t[hs..he];
+                    let dot = q_h
+                        .iter()
+                        .zip(k_h.iter())
+                        .fold(0.0.scalar(), |acc, (qj, kj)| {
+                            let prod = Value::mul(qj, kj);
+                            Value::add(&acc, &prod)
+                        });
+                    Value::mul(&dot, &attn_scale.scalar())
+                })
+                .collect();
+
+            let attn_weights = softmax(&attn_logits);
+
+            for j in 0..head_dim {
+                let head_out_j = values[li].iter().zip(attn_weights.iter()).fold(
+                    0.0.scalar(),
+                    |acc, (v_t, wt)| {
+                        let v_h_j = &v_t[hs + j];
+                        let weighted = Value::mul(wt, v_h_j);
+                        Value::add(&acc, &weighted)
+                    },
+                );
+                x_attn.push(head_out_j);
+            }
+        }
+
+        x = linear(&x_attn, &layer.attn_wo);
+        x = x.add_vec(&x_residual);
+
+        let x_residual = x.clone();
+        x = rmsnorm(&x);
+        x = linear(&x, &layer.mlp_fc1);
+        x = x.iter().map(Value::relu).collect();
+        x = linear(&x, &layer.mlp_fc2);
+        x = x.add_vec(&x_residual);
+    }
+
+    linear(&x, &model.lm_head)
+}
+
 fn get_input_dataset() -> Result<Vec<String>, Box<dyn std::error::Error>> {
     const INPUT_FILE: &str = "input.txt";
     const NAMES_URL: &str =
